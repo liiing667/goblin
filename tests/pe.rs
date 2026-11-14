@@ -1,6 +1,8 @@
 use plain::Plain;
 
 use goblin::pe::PE;
+use goblin::pe::analysis::AnomalyKind;
+use goblin::pe::options::{ParseMode, ParseOptions};
 
 static PE64_INDIRECT_SECTION_NAME: &[u8; 552] = &[
     0x4D, 0x5A, 0x78, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -57,4 +59,193 @@ fn test_indirect_section_name() {
         }
         Err(_) => unreachable!(),
     }
+}
+
+// Field offsets in PE64_INDIRECT_SECTION_NAME (PE32+ optional header at 0x90,
+// single section table entry at 0x180).
+const SYNTH_NUM_SECTIONS: usize = 0x7e;
+const SYNTH_OPT: usize = 0x90;
+const SYNTH_ENTRY: usize = SYNTH_OPT + 0x10;
+const SYNTH_SECTION_ALIGNMENT: usize = SYNTH_OPT + 0x20;
+const SYNTH_FILE_ALIGNMENT: usize = SYNTH_OPT + 0x24;
+const SYNTH_SIZE_OF_IMAGE: usize = SYNTH_OPT + 0x38;
+const SYNTH_SIZE_OF_HEADERS: usize = SYNTH_OPT + 0x3c;
+const SYNTH_CERT_DIR: usize = SYNTH_OPT + 0x70 + 4 * 8;
+const SYNTH_SECTIONS: usize = 0x180;
+const SYNTH_SECTION_SIZE: usize = 0x28;
+const SECTION_VIRTUAL_SIZE: usize = 0x08;
+const SECTION_VIRTUAL_ADDRESS: usize = 0x0c;
+const SECTION_SIZE_OF_RAW_DATA: usize = 0x10;
+const SECTION_POINTER_TO_RAW_DATA: usize = 0x14;
+
+fn put_u16(data: &mut [u8], offset: usize, value: u16) {
+    data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(data: &mut [u8], offset: usize, value: u32) {
+    data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Fixes up the synthetic test binary so that it is structurally sound:
+/// consistent alignments, a valid size of image/headers, an aligned raw
+/// section right after the headers, and a file-backed entry point.
+fn clean_synthetic_pe64() -> Vec<u8> {
+    let mut data = PE64_INDIRECT_SECTION_NAME.to_vec();
+    put_u32(&mut data, SYNTH_SECTION_ALIGNMENT, 0x1000);
+    put_u32(&mut data, SYNTH_FILE_ALIGNMENT, 0x200);
+    put_u32(&mut data, SYNTH_SIZE_OF_IMAGE, 0x2000);
+    put_u32(&mut data, SYNTH_SIZE_OF_HEADERS, 0x200);
+    put_u32(&mut data, SYNTH_ENTRY, 0x1000);
+    put_u32(&mut data, SYNTH_SECTIONS + SECTION_POINTER_TO_RAW_DATA, 0x200);
+    data
+}
+
+fn parse_permissive(data: &[u8]) -> PE<'_> {
+    PE::parse_with_opts(
+        data,
+        &ParseOptions::default().with_parse_mode(ParseMode::Permissive),
+    )
+    .unwrap()
+}
+
+fn assert_paths_sorted(pe: &PE<'_>) {
+    let analysis = pe.analyze();
+    let paths: Vec<&String> = analysis.anomalies().iter().map(|a| &a.path).collect();
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted, "anomalies are not sorted stably by path");
+}
+
+#[test]
+fn test_analyze_clean_synthetic() {
+    let data = clean_synthetic_pe64();
+    let pe = PE::parse(&data).unwrap();
+    let analysis = pe.analyze();
+    assert!(
+        analysis.is_ok(),
+        "unexpected anomalies: {:#?}",
+        analysis.anomalies()
+    );
+}
+
+#[test]
+fn test_analyze_clean_real_binaries() {
+    // PE32+ (x86_64) and PE32 (i386) binaries must both pass the unified checks.
+    for bytes in [
+        &include_bytes!("bins/pe/lld_no_tls_64.exe.bin")[..],
+        &include_bytes!("bins/pe/System.Xml.XDocument.dll")[..],
+    ] {
+        let pe = PE::parse(bytes).unwrap();
+        let analysis = pe.analyze();
+        assert!(
+            analysis.is_ok(),
+            "unexpected anomalies: {:#?}",
+            analysis.anomalies()
+        );
+    }
+}
+
+#[test]
+fn test_analyze_detects_raw_range_overlapping_headers() {
+    let mut data = clean_synthetic_pe64();
+    put_u32(&mut data, SYNTH_SECTIONS + SECTION_POINTER_TO_RAW_DATA, 0x100);
+    let pe = PE::parse(&data).unwrap();
+    let analysis = pe.analyze();
+    assert!(analysis.anomalies().iter().any(|a| {
+        a.kind == AnomalyKind::Overlap && a.path == "sections[0].pointer_to_raw_data"
+    }));
+    assert_paths_sorted(&pe);
+}
+
+#[test]
+fn test_analyze_detects_overlapping_sections() {
+    let mut data = clean_synthetic_pe64();
+    put_u16(&mut data, SYNTH_NUM_SECTIONS, 2);
+    put_u32(&mut data, SYNTH_SIZE_OF_IMAGE, 0x4000);
+    let s1 = SYNTH_SECTIONS + SYNTH_SECTION_SIZE;
+    data[s1..s1 + 8].copy_from_slice(b".second\0");
+    put_u32(&mut data, s1 + SECTION_VIRTUAL_SIZE, 0x100);
+    put_u32(&mut data, s1 + SECTION_VIRTUAL_ADDRESS, 0x2000);
+    put_u32(&mut data, s1 + SECTION_SIZE_OF_RAW_DATA, 0x8);
+    // Overlaps section 0's raw range [0x200, 0x208).
+    put_u32(&mut data, s1 + SECTION_POINTER_TO_RAW_DATA, 0x204);
+    let pe = PE::parse(&data).unwrap();
+    let analysis = pe.analyze();
+    assert!(analysis.anomalies().iter().any(|a| {
+        a.kind == AnomalyKind::Overlap && a.path == "sections[1].pointer_to_raw_data"
+    }));
+    assert_paths_sorted(&pe);
+}
+
+#[test]
+fn test_analyze_detects_entry_point_without_file_backing() {
+    let mut data = clean_synthetic_pe64();
+    put_u16(&mut data, SYNTH_NUM_SECTIONS, 2);
+    put_u32(&mut data, SYNTH_SIZE_OF_IMAGE, 0x4000);
+    let s1 = SYNTH_SECTIONS + SYNTH_SECTION_SIZE;
+    data[s1..s1 + 8].copy_from_slice(b".virtonly\0".get(..8).unwrap());
+    put_u32(&mut data, s1 + SECTION_VIRTUAL_SIZE, 0x100);
+    put_u32(&mut data, s1 + SECTION_VIRTUAL_ADDRESS, 0x2000);
+    // SizeOfRawData == 0: the section has no file backing.
+    put_u32(&mut data, SYNTH_ENTRY, 0x2000);
+    let pe = PE::parse(&data).unwrap();
+    let analysis = pe.analyze();
+    assert!(analysis.anomalies().iter().any(|a| {
+        a.kind == AnomalyKind::InvalidRva
+            && a.path == "optional_header.address_of_entry_point"
+            && a.message.contains("no file backing")
+    }));
+    assert_paths_sorted(&pe);
+}
+
+#[test]
+fn test_analyze_detects_misaligned_certificate_table() {
+    let mut data = clean_synthetic_pe64();
+    // The certificate table directory holds a file offset; it must be 8-byte aligned.
+    put_u32(&mut data, SYNTH_CERT_DIR, 0x209);
+    put_u32(&mut data, SYNTH_CERT_DIR + 4, 0x8);
+    let pe = parse_permissive(&data);
+    let analysis = pe.analyze();
+    assert!(analysis.anomalies().iter().any(|a| {
+        a.kind == AnomalyKind::Misaligned && a.path == "data_directories.certificate_table"
+    }));
+    assert_paths_sorted(&pe);
+}
+
+#[test]
+fn test_analyze_detects_certificate_table_out_of_file() {
+    let mut data = clean_synthetic_pe64();
+    put_u32(&mut data, SYNTH_CERT_DIR, 0x200);
+    put_u32(&mut data, SYNTH_CERT_DIR + 4, 0x100);
+    let pe = parse_permissive(&data);
+    let analysis = pe.analyze();
+    assert!(analysis.anomalies().iter().any(|a| {
+        a.kind == AnomalyKind::OutOfFileBounds && a.path == "data_directories.certificate_table"
+    }));
+    assert_paths_sorted(&pe);
+}
+
+#[test]
+fn test_analyze_detects_rva_integer_overflow() {
+    let mut data = clean_synthetic_pe64();
+    put_u32(&mut data, SYNTH_SECTIONS + SECTION_VIRTUAL_ADDRESS, 0xffff_f000);
+    put_u32(&mut data, SYNTH_SECTIONS + SECTION_VIRTUAL_SIZE, 0x2000);
+    let pe = PE::parse(&data).unwrap();
+    let analysis = pe.analyze();
+    assert!(analysis.anomalies().iter().any(|a| {
+        a.kind == AnomalyKind::IntegerOverflow && a.path == "sections[0].virtual_address"
+    }));
+    assert_paths_sorted(&pe);
+}
+
+#[test]
+fn test_analyze_detects_misaligned_file_alignment() {
+    let mut data = clean_synthetic_pe64();
+    put_u32(&mut data, SYNTH_FILE_ALIGNMENT, 0x300);
+    let pe = PE::parse(&data).unwrap();
+    let analysis = pe.analyze();
+    assert!(analysis.anomalies().iter().any(|a| {
+        a.kind == AnomalyKind::Misaligned && a.path == "optional_header.file_alignment"
+    }));
+    assert_paths_sorted(&pe);
 }

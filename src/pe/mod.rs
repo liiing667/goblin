@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use log::warn;
 use resource::ResourceData;
 
+pub mod analysis;
 pub mod authenticode;
 pub mod certificate_table;
 pub mod characteristic;
@@ -98,6 +99,16 @@ impl<'a> PE<'a> {
     /// Reads a PE binary from the underlying `bytes`
     pub fn parse(bytes: &'a [u8]) -> error::Result<Self> {
         Self::parse_with_opts(bytes, &options::ParseOptions::default())
+    }
+
+    /// Performs an optional strict structural analysis of this PE binary.
+    ///
+    /// Unlike parsing, which is lenient, this validates the structural integrity of the
+    /// image (RVA ranges, file ranges, alignment, and integer overflow, unified for
+    /// 32-bit and 64-bit binaries) and returns every anomaly found, sorted stably by
+    /// path. See [`analysis`] for details.
+    pub fn analyze(&self) -> analysis::Analysis {
+        analysis::analyze(self)
     }
 
     /// Reads a PE binary from the underlying `bytes`
